@@ -1,0 +1,507 @@
+================================================================================
+EVENT-DRIVEN ORDER PROCESSING PIPELINE — COMPLETE PROJECT REPORT
+================================================================================
+Author:   Aditya Joshi
+Date:     2026-07-09 (metrics measured this date)
+Repo:     event-driven-order-pipeline
+Machine:  Windows 11 Pro, Docker Desktop 24.0.2 (Hyper-V backend,
+          VM limited to 2 vCPUs / 2 GB RAM)
+
+CONTENTS
+  1.  Motivation
+  2.  Problem statement
+  3.  Tech stack (and why each piece)
+  4.  High-level design (HLD)
+  5.  Low-level design (LLD)
+  6.  Coding procedure / build order
+  7.  Running the project
+  8.  What went wrong on this machine (and the fix)
+  9.  Load-test methodology and measured metrics
+  10. Chaos test: retries, DLQ, and zero-loss verification
+  11. Distributed-tracing verification
+  12. Honest analysis of the numbers
+  13. Resume bullets these results support
+  14. Limitations and possible next steps
+
+--------------------------------------------------------------------------------
+1. MOTIVATION
+--------------------------------------------------------------------------------
+The project was built as a portfolio piece targeting backend / SDE roles
+(originally scoped against a Microsoft SDE job description). It fills specific
+skill gaps with hands-on, verifiable work rather than claims:
+
+  - Messaging & event-driven patterns (Service Bus / Event Hub / Kafka
+    equivalent) -> Redis Streams with consumer groups
+  - Cloud database patterns (Cosmos DB equivalent) -> PostgreSQL with
+    idempotent writes
+  - Telemetry & observability -> OpenTelemetry + Jaeger, end-to-end traces
+  - Reliability engineering -> retries with exponential backoff, dead-letter
+    queue, crash recovery, chaos testing
+  - CI/CD -> GitHub Actions (lint, test, build, push to GHCR)
+  - Load testing -> Locust, with real measured numbers
+
+Everything is deliberately cloud-agnostic (no vendor SDKs), so the design maps
+onto Azure Service Bus + Cosmos DB, AWS SQS/Kinesis + RDS, or GCP Pub/Sub
+equally well, and the project reads credibly for any employer.
+
+--------------------------------------------------------------------------------
+2. PROBLEM STATEMENT
+--------------------------------------------------------------------------------
+Build an order-ingestion backend where accepting an order is decoupled from
+processing it, such that:
+
+  a) The API responds fast (202 Accepted) regardless of downstream latency.
+  b) Processing is split into independent stages (validate -> enrich ->
+     persist) that scale horizontally and independently.
+  c) No order is ever silently lost: transient failures are retried with
+     exponential backoff; permanent failures and retry-exhausted messages go
+     to a dead-letter stream with full context, and can be replayed.
+  d) Duplicate delivery (inherent to at-least-once messaging) never corrupts
+     the database.
+  e) A single order can be traced end-to-end across every service it touched.
+  f) The whole system starts with one command and its performance claims are
+     backed by measured load tests.
+
+--------------------------------------------------------------------------------
+3. TECH STACK (AND WHY)
+--------------------------------------------------------------------------------
+  Language        Python 3.11 (containers) / 3.10 (local venv)
+  API             FastAPI + Pydantic v2 — async, typed request validation
+  Messaging       Redis Streams via redis-py (async) — XADD / XREADGROUP /
+                  XACK / XAUTOCLAIM. Chosen over Kafka because it provides the
+                  same core primitives (consumer groups, per-message ownership,
+                  pending-entries list for recovery) with one container and
+                  zero broker-cluster operations — right-sized for a solo
+                  project while exercising identical concepts.
+  Database        PostgreSQL 16 via asyncpg — idempotent upsert on order_id
+  Tracing         OpenTelemetry SDK -> OTel Collector -> Jaeger 1.60
+  Containers      Docker + Docker Compose (one command, full stack)
+  CI/CD           GitHub Actions (ruff lint -> pytest -> docker build -> GHCR)
+  Load testing    Locust 2.32.3
+  Tests           pytest + fakeredis (no infrastructure needed to run tests)
+
+--------------------------------------------------------------------------------
+4. HIGH-LEVEL DESIGN (HLD)
+--------------------------------------------------------------------------------
+
+  HTTP POST /orders            (202 Accepted, order_id returned immediately)
+        |
+        v
+  +--------------+   XADD    +------------------+
+  | Producer API | --------> | orders:created    |  (Redis Stream)
+  |  (FastAPI)   |           +------------------+
+  +--------------+                 | XREADGROUP (group: validation-workers)
+                                   v
+                          +---------------------+   XADD   +------------------+
+                          | Validation Consumer | -------> | orders:validated  |
+                          +---------------------+          +------------------+
+                                                                | (enrichment-workers)
+                                                                v
+                                                       +---------------------+
+                                                       | Enrichment Consumer |
+                                                       +---------------------+
+                                                                | XADD orders:enriched
+                                                                v
+                                                       +---------------------+
+                                                       | Persistence Consumer|--> PostgreSQL
+                                                       +---------------------+    (idempotent upsert)
+
+  Any stage failing after N retries --> orders:dlq (dead-letter stream)
+  All services --> OTel Collector --> Jaeger (one connected trace per order)
+
+Key architectural decisions:
+
+  - ONE STREAM PER STAGE, ONE CONSUMER GROUP PER STREAM. Each stage's workers
+    share a group, so adding replicas (docker compose --scale) automatically
+    partitions work with no code change.
+  - AT-LEAST-ONCE DELIVERY + IDEMPOTENT SINK. Redis redelivers un-acked
+    messages; the DB upsert makes duplicates harmless. This is the standard,
+    pragmatic alternative to exactly-once (which is expensive and fragile).
+  - TYPED FAILURE TAXONOMY. TransientError (network blip, chaos) is retried;
+    PermanentError (business-rule violation) skips retries and dead-letters
+    immediately. This distinction drives the whole reliability story.
+  - ACK-AFTER-SIDE-EFFECT ordering. A message is XACK'd only after the
+    downstream publish / DB write succeeds, so a crash between read and ack
+    leaves the message in the Pending Entries List for XAUTOCLAIM recovery.
+  - TRACE CONTEXT RIDES THE MESSAGE. The W3C traceparent header is injected
+    into every stream entry and extracted by the next consumer — this is what
+    makes one connected trace span a message bus (auto-instrumentation alone
+    cannot do this).
+
+--------------------------------------------------------------------------------
+5. LOW-LEVEL DESIGN (LLD)
+--------------------------------------------------------------------------------
+Module map (app/):
+
+  config.py          Pydantic BaseSettings, env-driven. Single Settings object
+                     shared by every service: stream names (orders:created /
+                     validated / enriched / dlq), group names, retry policy
+                     (max_retries=4, base 0.5s, cap 8s, jitter 0.25s), consumer
+                     loop tuning (read_count=50, block_ms=5000,
+                     idle_reclaim_ms=30000), FAIL_RATE chaos knob, DB pool
+                     sizes, OTel endpoint.
+
+  schemas.py         Pydantic models. OrderCreateRequest (API input, strict:
+                     extra="forbid", quantity 1..10000, price > 0, 1..100
+                     items) -> OrderEvent, the single JSON envelope that
+                     travels the entire pipeline and is progressively filled
+                     in: status created -> validated -> enriched -> persisted,
+                     with validated_at / enriched_at timestamps and an
+                     Enrichment sub-object (tax_amount, grand_total,
+                     warehouse, in_stock). Money is Decimal end-to-end.
+
+  errors.py          PipelineError base; TransientError (retry) vs
+                     PermanentError (straight to DLQ); ValidationRejected
+                     subclasses PermanentError.
+
+  retry.py           run_with_retry(func, policy): explicit loop, not a
+                     library, so PermanentError can short-circuit. Delay =
+                     base * 2^(attempt-1), capped, plus uniform jitter.
+                     Re-raises after max_retries so the caller dead-letters.
+
+  chaos.py           maybe_fail(rate, where): raises TransientError with
+                     probability FAIL_RATE — used to prove the retry/DLQ paths
+                     with real failures instead of assertions.
+
+  streams.py         All Redis Stream I/O. publish_event() serialises the
+                     OrderEvent to JSON in field "data" and injects the
+                     traceparent; XADD with MAXLEN ~100000 on the ingest
+                     stream so it cannot grow unbounded. ensure_group() does
+                     XGROUP CREATE ... MKSTREAM, tolerating BUSYGROUP.
+                     send_to_dlq() writes source_stream, reason_code, error
+                     (truncated), attempts, failed_at, and the full original
+                     fields so replay is lossless.
+
+  consumer_base.py   The heart of the system: a reusable Consumer class so
+                     each stage only implements process(event) -> event.
+                     Loop per iteration:
+                       1) XAUTOCLAIM (min idle 30s) — adopt messages a crashed
+                          sibling read but never acked (PEL recovery).
+                       2) XREADGROUP ">" count=50 block=5000ms — new messages.
+                       3) For each message: extract trace context, open a
+                          CONSUMER span, parse the event (malformed body ->
+                          DLQ immediately, reason "malformed_message"), run
+                          the stage processor under run_with_retry.
+                          - success: publish to next stream (if any), XACK.
+                          - PermanentError: DLQ with reason, XACK.
+                          - retries exhausted: DLQ with attempts count, XACK.
+                          (XACK always follows the DLQ write, so the message
+                          is never both lost and unacked.)
+                     Graceful shutdown on SIGINT/SIGTERM.
+
+  producer/main.py   FastAPI app. POST /orders: validate -> OrderEvent.
+                     from_request() (computes Decimal subtotal) -> XADD to
+                     orders:created inside a "publish order.created" span ->
+                     202 + Location header. GET /health pings Redis.
+
+  consumers/
+    validation.py    Business rules: non-empty items, quantity > 0, unit
+                     price in (0, 100000], recomputed subtotal must equal the
+                     claimed subtotal, order total <= 1,000,000. Violations
+                     raise ValidationRejected (permanent -> DLQ, no retries).
+    enrichment.py    Mock domain work: 9.25% tax (Decimal, ROUND_HALF_UP),
+                     grand_total, deterministic warehouse assignment by
+                     hash(order_id) across 3 regions.
+    persistence.py   db.upsert_order(event); terminal stage (no next stream).
+
+  db.py              asyncpg pool. Schema (created idempotently at startup):
+                     orders(order_id TEXT PK, customer_id, status, currency
+                     CHAR(3), item_count INT, subtotal/tax_amount/grand_total
+                     NUMERIC(14,2), warehouse, payload JSONB, created_at,
+                     updated_at) + indexes on customer_id and status.
+                     Upsert: INSERT ... ON CONFLICT (order_id) DO UPDATE ...
+                     RETURNING (xmax = 0) AS inserted — a Postgres trick that
+                     reports whether the row was new (insert) or refreshed
+                     (duplicate delivery).
+
+  telemetry.py       OTel setup per service + inject_trace_context /
+                     extract_trace_context — W3C traceparent carried in the
+                     stream message fields; FastAPI, redis, asyncpg
+                     auto-instrumentation on top.
+
+  tools/dlq.py       CLI: list / stats (counts by reason and source stream) /
+                     replay (XADD the preserved original body back onto its
+                     source stream, then XDEL from the DLQ only after the
+                     re-publish succeeds).
+
+Tests (tests/, run with plain `pytest`, no infra — fakeredis in-memory):
+  test_schemas.py        input validation edge cases
+  test_retry.py          backoff timing, permanent short-circuit, exhaustion
+  test_processing.py     per-stage business logic
+  test_producer_api.py   API contract (202, body shape, validation errors)
+  test_consumer_flow.py  full consumer loop: forward-on-success,
+                         DLQ-on-permanent, retry-then-DLQ-on-transient
+
+Deployment files:
+  Dockerfile             one image for producer + all consumers (command
+                         selects the role) — keeps builds simple and images
+                         identical.
+  Dockerfile.otel        bakes otel-collector-config.yaml into the collector
+                         image (see section 8 for why).
+  docker-compose.yml     redis (AOF persistence), postgres 16, jaeger
+                         (MEMORY_MAX_TRACES=5000), otel-collector, producer
+                         (:8000), validation, enrichment, persistence.
+                         Healthchecks gate startup ordering. Consumers scale
+                         with --scale.
+  .github/workflows/ci.yml  ruff -> pytest -> docker build; push to GHCR on
+                         main.
+
+--------------------------------------------------------------------------------
+6. CODING PROCEDURE / BUILD ORDER
+--------------------------------------------------------------------------------
+The system was built incrementally, each step verified before the next:
+
+  1. Producer API + Redis Stream publish (one event flowing, logged).
+  2. Persistence consumer + PostgreSQL (simplest consumer; proves the loop).
+  3. Validation consumer (business rules; first real DLQ path).
+  4. Enrichment consumer (completes the 3-stage pipeline).
+  5. Retry + DLQ logic retrofitted into the shared consumer base.
+  6. OpenTelemetry instrumentation + traceparent propagation.
+  7. Docker Compose for the full stack.
+  8. GitHub Actions CI.
+  9. Locust load testing (this report records the first real numbers).
+ 10. README + this report.
+
+Design disciplines followed throughout:
+  - Shared code extracted once (consumer_base, streams, retry) instead of
+    copy-pasted per consumer.
+  - Every reliability claim testable on demand (FAIL_RATE knob, DLQ CLI).
+  - No estimated numbers anywhere — metrics only after measuring.
+
+--------------------------------------------------------------------------------
+7. RUNNING THE PROJECT
+--------------------------------------------------------------------------------
+  # Full stack (Redis, Postgres, Jaeger, OTel Collector, API, 3 consumers):
+  docker compose up --build -d
+  docker compose ps                         # all healthy
+
+  # Submit an order:
+  curl -X POST http://localhost:8000/orders -H "Content-Type: application/json" \
+    -d "{\"customer_id\":\"cust_123\",\"currency\":\"USD\",\"items\":[{\"product_id\":\"sku-1\",\"quantity\":2,\"unit_price\":19.99}]}"
+  # -> 202 {"order_id":"ord_...","status":"created",...}
+
+  # Verify it landed (validated -> enriched -> persisted):
+  docker compose exec postgres psql -U orders -d orders \
+    -c "SELECT order_id, status, grand_total, warehouse FROM orders;"
+
+  # UIs:
+  #   Swagger:  http://localhost:8000/docs
+  #   Jaeger:   http://localhost:16686
+
+  # Scale consumers:
+  docker compose up -d --scale validation=2 --scale enrichment=3 --scale persistence=2
+
+  # Chaos mode (30% of consumer steps fail transiently):
+  FAIL_RATE=0.3 docker compose up -d
+
+  # DLQ tooling:
+  python -m app.tools.dlq stats | list | replay
+
+  # Tests + lint (no infrastructure needed):
+  pytest -q
+  ruff check app tests
+
+  # Load test:
+  .venv/Scripts/locust -f locust/locustfile.py --host http://localhost:8000 \
+      --headless -u 100 -r 20 -t 2m --csv results/1x
+
+  # Tear down:
+  docker compose down          # keep volumes
+  docker compose down -v       # also wipe redis/postgres data
+
+--------------------------------------------------------------------------------
+8. WHAT WENT WRONG ON THIS MACHINE (AND THE FIX)
+--------------------------------------------------------------------------------
+SYMPTOM: `docker compose up` appeared to hang for 290+ seconds at
+"Container ... Creating" for redis/postgres/jaeger, while image builds
+completed fine.
+
+DIAGNOSIS (in order):
+  1. Direct engine operations were fast: `docker create redis:7-alpine` took
+     0.6 s, and `docker start` on a stuck container worked instantly — so the
+     Docker engine itself was healthy; the hang was compose-specific.
+  2. A longer retry surfaced the real error:
+        "Error response from daemon: user declined directory sharing
+         C:\...\event-driven-order-pipeline\otel-collector-config.yaml"
+  3. Root cause: this Docker Desktop installation uses the HYPER-V backend
+     (wslEngineEnabled=false) with an explicit file-sharing allowlist
+     (settings.json -> filesharingDirectories), and the project path — under
+     OneDrive — was not on it. The two services that bind-mount local files
+     (postgres's ./db/init.sql and the otel-collector's config) triggered a
+     GUI permission popup, which was declined / timed out unattended. The
+     "hang" was compose silently waiting on that popup. Services without bind
+     mounts (redis, jaeger) were unaffected.
+
+FIX (made the project self-contained instead of touching Docker settings):
+  a) Removed the ./db/init.sql bind mount from the postgres service. It was
+     redundant by design — app/db.py creates the schema idempotently at
+     startup (init.sql itself documents this). The file remains in the repo
+     as reviewable schema documentation.
+  b) Replaced the otel-collector config bind mount with a tiny built image
+     (Dockerfile.otel: FROM otel/opentelemetry-collector-contrib:0.111.0 +
+     COPY of the config). Image builds transfer the build context as a tar
+     stream to the daemon, so they need no file-sharing approval.
+  c) Added MEMORY_MAX_TRACES=5000 to Jaeger so its in-memory trace store
+     cannot balloon during load tests inside the 2 GB Docker VM.
+
+RESULT: `docker compose up -d --build` brought up all 8 services cleanly in
+seconds, and the stack now runs on any machine regardless of Docker Desktop
+file-sharing configuration — a genuine robustness improvement, not a
+workaround.
+
+(Also fixed: Locust install initially failed because pip tried to build
+gevent from source on Python 3.10/Windows; pinning gevent==24.2.1, which
+ships a prebuilt win_amd64 wheel, resolved it.)
+
+--------------------------------------------------------------------------------
+9. LOAD-TEST METHODOLOGY AND MEASURED METRICS
+--------------------------------------------------------------------------------
+Environment (matters for interpreting the numbers):
+  - Windows 11 laptop; Docker Desktop 24.0.2, Hyper-V backend
+  - Docker VM capped at 2 vCPUs / 2 GB RAM — the ENTIRE stack (Redis,
+    Postgres, Jaeger, OTel Collector, API, all consumers) shares this.
+  - Load generator (Locust) ran on the host, hitting localhost:8000.
+
+Scenario (locust/locustfile.py): randomized realistic orders (1-4 items,
+random products/customers/prices), 10:1 mix of POST /orders to GET /health,
+per-user wait 0.05-0.3 s. Command per run:
+  locust --headless -u 100 -r 20 -t 2m --csv results/<run>
+
+RUN 1 — BASELINE, one consumer per stage (1/1/1):
+  POST /orders:  17,995 requests, 150.29 req/s sustained, 0 failures (0.00%)
+                 p50 380 ms | p90 690 ms | p95 810 ms | p99 1,200 ms
+                 avg 412 ms | min 4 ms | max 2,751 ms
+  Pipeline:      consumers kept pace IN REAL TIME — at test end every stream
+                 group showed lag=0, pending=0; all 17,995 orders were already
+                 in PostgreSQL; DLQ empty.
+
+RUN 2 — SCALED consumers (validation=2, enrichment=3, persistence=2):
+  POST /orders:  14,373 requests, 120.41 req/s sustained, 0 failures (0.00%)
+                 p50 540 ms | p90 900 ms | p95 1,100 ms | p99 1,300 ms
+  Pipeline:      again lag=0, pending=0, everything persisted, DLQ empty.
+
+REFERENCE — low concurrency (10 users, 30 s):
+  POST /orders:  47 req/s (rate limited by user count), p50 6 ms, p95 13 ms.
+
+CSV artifacts: results/1x_stats.csv, results/3x_stats.csv (+ history files).
+
+--------------------------------------------------------------------------------
+10. CHAOS TEST: RETRIES, DLQ, AND ZERO-LOSS VERIFICATION
+--------------------------------------------------------------------------------
+Setup: consumers restarted with FAIL_RATE=0.3 — every consumer processing
+step (validation, enrichment, persistence) independently raises a transient
+failure 30% of the time. Retry policy: 4 attempts with backoff 0.5s -> 1s ->
+2s -> 4s (jittered); exhaustion dead-letters the message.
+
+Sent: 1,397 orders (Locust, 10 users, 30 s). API error rate: 0.00% —
+ingestion is unaffected by consumer failures, by design.
+
+Observed:
+  - Throughput under chaos dropped sharply (backoff sleeps serialize each
+    consumer's loop) — the backlog drained steadily at roughly 3-4 orders/s
+    per stage and reached zero in ~7 minutes. Expected and correct behavior.
+  - 1,364 orders persisted after automatic retries succeeded.
+  - 34 orders (2.4%) exhausted all 4 attempts and were dead-lettered — close
+    to theory: P(4 consecutive failures) = 0.3^4 = 0.81% per stage, ~2.4%
+    across three stages.
+  - DLQ breakdown: 14 failed at persistence, 10 at validation, 10 at
+    enrichment; all reason_code=transient_error, attempts=4; each entry
+    preserved the full original payload + traceparent.
+  - ACCOUNTING: 1,364 persisted + 34 dead-lettered = 1,398 accounted vs
+    1,397 sent (+1 was a straggler from the previous run) -> NOTHING LOST.
+
+Replay: chaos disabled (FAIL_RATE=0), then `python -m app.tools.dlq replay`
+re-injected all 34 originals onto their source streams. All 34 flowed through
+and persisted. Final state: DLQ length 0; PostgreSQL contains every order
+ever submitted across all runs (33,861 rows). ZERO MESSAGE LOSS, END TO END.
+
+--------------------------------------------------------------------------------
+11. DISTRIBUTED-TRACING VERIFICATION
+--------------------------------------------------------------------------------
+A fresh order was submitted and its trace fetched from the Jaeger API:
+
+  - ONE connected trace, 16 spans, spanning ALL FOUR services:
+    producer-api, validation-consumer, enrichment-consumer,
+    persistence-consumer.
+  - Operations visible in the single trace: POST /orders -> publish
+    order.created (XADD) -> validation-workers process -> XADD/XACK ->
+    enrichment-workers process -> persistence-workers process -> INSERT.
+
+This works because the W3C traceparent is injected into each Redis Stream
+message and extracted by the next consumer (app/telemetry.py) — the part
+auto-instrumentation cannot do across a message bus.
+
+Jaeger UI: http://localhost:16686 (service: producer-api, operation:
+POST /orders).
+
+--------------------------------------------------------------------------------
+12. HONEST ANALYSIS OF THE NUMBERS
+--------------------------------------------------------------------------------
+  - THE BOTTLENECK IS INGESTION, NOT PROCESSING. A single consumer per stage
+    already processed 150 orders/s in real time with zero backlog, because
+    each stage's work is a few hundred microseconds of CPU plus fast Redis /
+    Postgres I/O. The producer API — a single uvicorn worker sharing 2 vCPUs
+    with 7+ containers — saturated first.
+  - WHY THE SCALED RUN WAS SLOWER (120 vs 150 req/s): adding 4 consumer
+    replicas on the SAME 2-vCPU VM took CPU away from the producer. Consumer
+    scaling pays off when consumers are the bottleneck (heavier per-message
+    work, or real CPU headroom to scale into) — demonstrating the correct
+    engineering judgment of measuring before assuming scaling helps.
+  - LATENCY UNDER LOAD IS QUEUEING, NOT WORK: p50 is ~6 ms at 10 users vs
+    380 ms at 100 users on the same endpoint.
+  - The 2 GB / 2 vCPU Docker VM makes every number conservative; the same
+    stack on a typical cloud instance would post substantially higher
+    throughput. What the results DO demonstrate rigorously: 0.00% error rate
+    at sustained 150 req/s, real-time pipeline processing, zero message loss
+    under 30% injected failure, and complete DLQ recovery.
+
+--------------------------------------------------------------------------------
+13. RESUME BULLETS THESE RESULTS SUPPORT
+--------------------------------------------------------------------------------
+Now backed by measurements (safe to claim):
+
+  - Designed and built an event-driven order-processing pipeline (FastAPI,
+    Redis Streams, PostgreSQL, Docker) decoupling ingestion, validation,
+    enrichment, and persistence into independently scalable consumer-group
+    services; sustained 150 orders/sec with 0% errors (p95 810 ms under 100
+    concurrent users) on a 2-vCPU Docker VM, with consumers processing the
+    full stream in real time (zero backlog).
+  - Implemented exponential-backoff retries and dead-letter-stream handling
+    with replay tooling; verified zero message loss under a 30% injected
+    failure rate — 1,397/1,397 orders recovered (97.6% via automatic retry,
+    the rest dead-lettered with full context and replayed to completion).
+  - Instrumented end-to-end distributed tracing with OpenTelemetry by
+    propagating W3C trace context through stream messages, producing a single
+    connected Jaeger trace per order across all four services (API -> 3
+    consumers -> PostgreSQL).
+  - Ensured idempotent persistence (INSERT ... ON CONFLICT upsert keyed on
+    order ID), making at-least-once redelivery safe; recovered crashed-
+    consumer messages via Redis pending-entries reclaim (XAUTOCLAIM).
+  - Containerized all services with Docker Compose (one-command stack) and
+    automated lint/test/build/publish with GitHub Actions CI to GHCR.
+
+Phrasing caution kept honest: do NOT claim "scaled consumers 1->3x to
+increase throughput" — on this hardware ingestion was the bottleneck and the
+report says so. The zero-loss chaos result and the connected-trace result are
+the strongest, fully verified claims.
+
+--------------------------------------------------------------------------------
+14. LIMITATIONS AND POSSIBLE NEXT STEPS
+--------------------------------------------------------------------------------
+  - Producer is a single uvicorn worker; multiple workers (or replicas behind
+    a load balancer) would raise the ingest ceiling — then consumer scaling
+    could be demonstrated meaningfully. Re-run on >=4 vCPUs for headroom.
+  - Redis is a single node (AOF persistence, no replication); production
+    would want Redis Sentinel/Cluster or a managed equivalent.
+  - No GET /orders/{id} read path (the Location header points at one) — a
+    small, natural addition.
+  - DLQ replay is manual by design (operator decision); could add an
+    automated re-drive policy with poison-message caps.
+  - GitHub Actions CI exists but a deploy stage (Render/Fly.io free tier)
+    would complete the CD story.
+  - Metrics (Prometheus counters for processed/retried/dead-lettered) would
+    complement the tracing story.
+
+================================================================================
+END OF REPORT
+================================================================================
