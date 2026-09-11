@@ -1,0 +1,4 @@
+# Bake the collector config into the image instead of bind-mounting it, so
+# the stack runs on machines where the project path isn't Docker-file-shared.
+FROM otel/opentelemetry-collector-contrib:0.111.0
+COPY otel-collector-config.yaml /etc/otel-collector-config.yaml

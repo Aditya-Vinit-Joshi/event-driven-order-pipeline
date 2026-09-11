@@ -1,0 +1,144 @@
+# One command brings up the entire pipeline:  docker compose up --build
+#
+#   producer (API)                -> :8000
+#   validation/enrichment/persistence consumers (scale with --scale)
+#   redis, postgres, otel-collector, jaeger UI -> :16686
+#
+# Consumers can be scaled independently, e.g.
+#   docker compose up --scale enrichment=3 --scale persistence=2
+
+x-app-image: &app-image
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: order-pipeline:latest
+
+x-consumer-env: &consumer-env
+  REDIS_URL: redis://redis:6379/0
+  DATABASE_URL: postgresql://orders:orders@postgres:5432/orders
+  OTEL_ENABLED: "true"
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+  FAIL_RATE: "${FAIL_RATE:-0.0}"
+  LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: orders
+      POSTGRES_PASSWORD: orders
+      POSTGRES_DB: orders
+    ports:
+      - "5432:5432"
+    volumes:
+      # NOTE: db/init.sql is intentionally NOT bind-mounted — the persistence
+      # consumer creates the schema idempotently at startup, and bind mounts
+      # require Docker Desktop file-sharing approval for this path.
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orders -d orders"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+      # Bound the in-memory trace store so load tests can't OOM the Docker VM.
+      MEMORY_MAX_TRACES: "5000"
+    ports:
+      - "16686:16686"   # Jaeger UI
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:16686/"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  otel-collector:
+    # Config is baked into the image (Dockerfile.otel) rather than bind-mounted
+    # so no Docker Desktop file-sharing approval is needed for this path.
+    build:
+      context: .
+      dockerfile: Dockerfile.otel
+    image: order-pipeline-otel:latest
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    ports:
+      - "4317:4317"     # OTLP gRPC
+    depends_on:
+      jaeger:
+        condition: service_started
+
+  producer:
+    <<: *app-image
+    command: ["uvicorn", "app.producer.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      <<: *consumer-env
+      SERVICE_NAME: producer-api
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8000/health').status==200 else sys.exit(1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  validation:
+    <<: *app-image
+    command: ["python", "-m", "app.consumers.validation"]
+    environment:
+      <<: *consumer-env
+      SERVICE_NAME: validation-consumer
+    depends_on:
+      redis:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+
+  enrichment:
+    <<: *app-image
+    command: ["python", "-m", "app.consumers.enrichment"]
+    environment:
+      <<: *consumer-env
+      SERVICE_NAME: enrichment-consumer
+    depends_on:
+      redis:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+
+  persistence:
+    <<: *app-image
+    command: ["python", "-m", "app.consumers.persistence"]
+    environment:
+      <<: *consumer-env
+      SERVICE_NAME: persistence-consumer
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+
+volumes:
+  redis-data:
+  pg-data:
