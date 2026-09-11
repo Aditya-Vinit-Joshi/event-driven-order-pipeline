@@ -1,0 +1,19 @@
+[project]
+name = "event-driven-order-pipeline"
+version = "1.0.0"
+description = "Event-driven order processing pipeline (FastAPI + Redis Streams + PostgreSQL)"
+requires-python = ">=3.10"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "C4"]
+ignore = ["B008"]  # FastAPI uses function calls in argument defaults (Depends)
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
