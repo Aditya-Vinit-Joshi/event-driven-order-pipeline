@@ -24,7 +24,7 @@ jobs:
         run: ruff check app tests
 
       - name: Unit tests (pytest)
-        run: pytest -q
+        run: python -m pytest -q
 
   build-image:
     needs: lint-test

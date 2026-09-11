@@ -46,9 +46,12 @@ def setup_telemetry(settings: Settings) -> None:
 
 
 def instrument_fastapi(app) -> None:
-    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    try:
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
-    FastAPIInstrumentor.instrument_app(app)
+        FastAPIInstrumentor.instrument_app(app)
+    except Exception:  # pragma: no cover - instrumentation is best-effort
+        pass
 
 
 def instrument_redis() -> None:
